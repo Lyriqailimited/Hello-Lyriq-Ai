@@ -1,0 +1,17 @@
+{
+  "call_id": "DLR-00421",
+  "dealer_id": "DLR-00421",
+  "name": "Jane Smith",
+  "phone": "555-867-5309",
+  "transcript": "Agent greeted the debtor Jane Smith. Debtor acknowledged the outstanding balance of $4,200. Debtor stated they will pay $500 by end of month. Agent confirmed the arrangement and reminded of next steps.",
+  "summary": "Debtor acknowledged balance and committed to partial payment of $500.",
+  "duration": 372,
+  "timestamp": "2026-03-12T14:30:00",
+  "past_due": 45,
+  "original_balance": 4200.00,
+  "outstanding_amount": 4200.00,
+  "promise_amount": 500.00,
+  "compliance_flags": "TCPA_OK",
+  "dispute_flag": false,
+  "sentiment_raw": "0.72"
+}
