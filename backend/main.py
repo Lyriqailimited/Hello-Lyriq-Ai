@@ -6,14 +6,18 @@ Registers all routers, enables CORS, and sets up logging and error handling.
 import logging
 import os
 import time
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from routers import ingest, decisions, analytics
+from routers import ingest, decisions, analytics, chatbot
 from database.database import engine, Base, SessionLocal
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -119,6 +123,7 @@ def health_check():
 app.include_router(ingest.router)
 app.include_router(decisions.router)
 app.include_router(analytics.router)
+app.include_router(chatbot.router)
 
 logger.info("Marco started — log_level=%s", LOG_LEVEL)
 
