@@ -126,7 +126,7 @@ class AnalyticsChatbot:
             openai_api_key=self.api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             temperature=0.5,  # More deterministic for SQL generation
-            max_tokens=512,  # Reasonable limit for most responses (saves credits!)
+            max_tokens=1024,  # Reasonable limit for most responses (saves credits!)
         )
 
         # Create the SQL toolkit and agent
@@ -143,7 +143,7 @@ class AnalyticsChatbot:
             agent_type="openai-tools",
             verbose=True,
             prefix=formatted_prompt,
-            max_iterations=5,
+            max_iterations=4,
             max_execution_time=30,
         )
 
@@ -204,8 +204,17 @@ class AnalyticsChatbot:
             # Process analytics question through the agent
             result = self.agent.invoke({"input": user_message})
 
+            # Log what the agent returned for debugging
+            logger.info(f"Agent result keys: {result.keys()}")
+            logger.debug(f"Full agent result: {result}")
+
             # Extract the response
             response = result.get("output", "I'm sorry, I couldn't process that request.")
+
+            # Validate response is not empty/null
+            if not response or not response.strip():
+                logger.warning(f"Agent returned empty response. Intermediate steps: {len(result.get('intermediate_steps', []))}")
+                response = "I'm sorry, I couldn't generate a response for that query. Could you try rephrasing your question?"
 
             # Try to extract SQL from intermediate steps (if available)
             sql_query = None
