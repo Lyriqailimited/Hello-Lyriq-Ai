@@ -1,183 +1,143 @@
 """
-Intent classification service using Claude API via LangChain.
+Intent classification service using OpenRouter API (OpenAI-compatible).
 
-Classifies a call transcript summary into one of:
-  - COMMITTED   (debtor agreed to pay)
-  - CONDITIONAL (debtor expressed conditional willingness)
-  - EVASIVE     (debtor avoided commitment)
+Classifies a call transcript into one of 9 outcome classes:
+  1. Promise to Pay
+  2. Call Reschedule or Callback Requested
+  3. Invoice Dispute
+  4. Refused to Pay
+  5. Already Paid (Claimed)
+  6. No Outcome / Unavailable
+  7. Requested Invoice Copy
+  8. Requested Payment Link
+  9. Reminder Delivered
 
-Returns {"intent_class": str, "confidence": float}.
-
-Uses Claude API via LangChain structured output when ANTHROPIC_API_KEY is set,
-falls back to keyword-based classification otherwise.
+Returns {"intent_class": str, "call_outcome": str, "confidence": float}.
 """
 
+import json
 import logging
 import os
+import requests
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Keyword-based classifier fallback
-_COMMITTED_KEYWORDS = ["will pay", "agree", "committed", "promise to pay", "i can pay"]
-_CONDITIONAL_KEYWORDS = ["maybe", "if", "possibly", "might", "consider", "depends"]
-_EVASIVE_KEYWORDS = [
-    "cannot",
-    "refuse",
-    "not able",
-    "won't",
-    "don't have",
-    "no money",
-    "dispute",
+VALID_OUTCOMES = [
+    "Promise to Pay",
+    "Call Reschedule or Callback Requested",
+    "Invoice Dispute",
+    "Refused to Pay",
+    "Already Paid (Claimed)",
+    "No Outcome / Unavailable",
+    "Requested Invoice Copy",
+    "Requested Payment Link",
+    "Reminder Delivered",
 ]
 
-# LangChain imports (only if API key is available)
-_claude_chain = None
+_KEYWORD_MAP = [
+    ("Promise to Pay",                        ["will pay", "promise to pay", "i'll pay", "i will pay", "agreed to pay", "payment arrangement", "i can pay"]),
+    ("Call Reschedule or Callback Requested", ["call back", "callback", "call me back", "reschedule", "call again", "better time", "try again later"]),
+    ("Invoice Dispute",                       ["dispute", "disputed", "incorrect", "wrong amount", "not mine", "escalate", "manager"]),
+    ("Already Paid (Claimed)",                ["already paid", "paid already", "i paid", "payment was made", "sent the payment"]),
+    ("Refused to Pay",                        ["refuse", "won't pay", "will not pay", "not paying", "hung up", "disconnected", "refused"]),
+    ("No Outcome / Unavailable",              ["no answer", "voicemail", "not available", "unavailable", "could not reach"]),
+    ("Requested Invoice Copy",                ["invoice copy", "send invoice", "copy of invoice", "resend", "documentation"]),
+    ("Requested Payment Link",                ["payment link", "pay online", "send link", "portal", "online payment"]),
+    ("Reminder Delivered",                    ["reminder", "left message", "voicemail left", "message left"]),
+]
+
+_SYSTEM_PROMPT = """You are an expert at analyzing B2B debt collection / accounts-receivable call transcripts.
+
+Classify the PRIMARY outcome of the call based on what the debtor said and did.
+
+Choose EXACTLY one of these outcomes:
+1. Promise to Pay — Debtor explicitly agreed to pay a specific amount, or committed to a payment date/plan.
+2. Call Reschedule or Callback Requested — Debtor asked to be called back or requested a better time to discuss.
+3. Invoice Dispute — Debtor disputed the invoice amount, claimed it is incorrect, or requested escalation to resolve a discrepancy.
+4. Refused to Pay — Debtor clearly refused to pay, was uncooperative, or ended the call without any commitment.
+5. Already Paid (Claimed) — Debtor claimed the invoice has already been paid.
+6. No Outcome / Unavailable — Could not reach the debtor; no meaningful discussion took place.
+7. Requested Invoice Copy — Debtor asked for a copy of the invoice or supporting documentation (without disputing).
+8. Requested Payment Link — Debtor asked for a payment link or online payment portal.
+9. Reminder Delivered — A reminder was delivered via voicemail or brief message with no substantive discussion.
+
+Rules:
+- Base your decision ONLY on the debtor's responses, not the agent's prompts.
+- If the debtor said "No" to payment AND "No" to a commitment date with no other context, classify as "Refused to Pay".
+- Pick the single most dominant outcome.
+
+Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
+{"intent_class": "<one of the 9 outcomes above>", "confidence": <0.0-1.0>, "reasoning": "<one sentence>"}"""
 
 
-def _init_claude_chain():
-    """Initialize the Claude API chain with LangChain structured output."""
-    global _claude_chain
+def _classify_via_claude_api(transcript: str) -> dict[str, Any]:
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
 
-    if _claude_chain is not None:
-        return _claude_chain
-
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-
-    try:
-        from langchain_anthropic import ChatAnthropic
-        from langchain_core.prompts import ChatPromptTemplate
-        from langchain_core.pydantic_v1 import BaseModel, Field
-
-        # Structured output schema
-        class IntentClassification(BaseModel):
-            """Intent classification result."""
-            intent_class: str = Field(
-                description="The classified intent: COMMITTED, CONDITIONAL, or EVASIVE"
-            )
-            confidence: float = Field(
-                description="Confidence score between 0 and 1"
-            )
-            reasoning: str = Field(
-                description="Brief explanation for the classification"
-            )
-
-        # Prompt template
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert at analyzing debt collection call transcripts.
-
-Classify the debtor's intent into one of three categories:
-
-1. COMMITTED - The debtor clearly agreed to pay or made a firm commitment
-   Examples: "I will pay $500 by Friday", "I agree to the payment plan", "I promise to pay"
-
-2. CONDITIONAL - The debtor expressed willingness but with conditions or uncertainty
-   Examples: "Maybe I can pay next week", "If I get my paycheck, I'll send something", "I might be able to pay"
-
-3. EVASIVE - The debtor refused, avoided commitment, or was uncooperative
-   Examples: "I refuse to pay", "I can't pay anything", "I won't discuss this", "I dispute this debt"
-
-Provide a confidence score between 0 and 1 based on how clear the intent is in the transcript.
-"""),
-            ("user", "Classify the intent in this call transcript summary:\n\n{transcript_summary}")
-        ])
-
-        # Create the chain with structured output
-        llm = ChatAnthropic(
-            model="claude-3-5-haiku-20241022",
-            temperature=0,
-            api_key=api_key
-        )
-
-        _claude_chain = prompt | llm.with_structured_output(IntentClassification)
-        logger.info("Claude API chain initialized successfully (model: claude-3-5-haiku)")
-        return _claude_chain
-
-    except Exception as e:
-        logger.warning("Failed to initialize Claude API chain: %s", e)
-        return None
-
-
-def _classify_via_claude_api(summary: str) -> dict[str, Any]:
-    """Classify intent using Claude API via LangChain."""
-    chain = _init_claude_chain()
-    if chain is None:
-        raise Exception("Claude chain not initialized")
-
-    result = chain.invoke({"transcript_summary": summary})
-
-    # Normalize intent_class to uppercase
-    intent_class = result.intent_class.upper()
-
-    # Validate intent_class
-    if intent_class not in ["COMMITTED", "CONDITIONAL", "EVASIVE"]:
-        logger.warning(
-            "Claude returned invalid intent '%s', defaulting to CONDITIONAL",
-            intent_class
-        )
-        intent_class = "CONDITIONAL"
-
-    # Clamp confidence to [0, 1]
-    confidence = max(0.0, min(1.0, result.confidence))
-
-    logger.info(
-        "Claude API classification: %s (confidence=%.4f) — %s",
-        intent_class,
-        confidence,
-        result.reasoning
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "anthropic/claude-haiku-4-5",
+            "max_tokens": 256,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": f"Classify the outcome of this call transcript:\n\n{transcript}"},
+            ],
+        },
+        timeout=30,
     )
+    response.raise_for_status()
 
-    return {
-        "intent_class": intent_class,
-        "confidence": round(confidence, 4)
-    }
+    raw = response.json()["choices"][0]["message"]["content"].strip()
 
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    parsed = json.loads(raw.strip())
 
-def _classify_via_keywords(summary: str) -> dict[str, Any]:
-    """Fallback keyword-based classification."""
-    text = summary.lower()
+    intent_class = parsed.get("intent_class", "").strip()
+    if intent_class not in VALID_OUTCOMES:
+        logger.warning("Claude returned invalid outcome %r, defaulting to 'No Outcome / Unavailable'", intent_class)
+        intent_class = "No Outcome / Unavailable"
 
-    for kw in _COMMITTED_KEYWORDS:
-        if kw in text:
-            logger.info("Intent classified: COMMITTED (keyword=%r, confidence=0.70)", kw)
-            return {"intent_class": "COMMITTED", "confidence": 0.70}
+    confidence = round(max(0.0, min(1.0, float(parsed.get("confidence", 0.5)))), 4)
+    logger.info("Claude classified: %r (confidence=%.4f) — %s", intent_class, confidence, parsed.get("reasoning", ""))
 
-    for kw in _EVASIVE_KEYWORDS:
-        if kw in text:
-            logger.info("Intent classified: EVASIVE (keyword=%r, confidence=0.65)", kw)
-            return {"intent_class": "EVASIVE", "confidence": 0.65}
-
-    for kw in _CONDITIONAL_KEYWORDS:
-        if kw in text:
-            logger.info("Intent classified: CONDITIONAL (keyword=%r, confidence=0.60)", kw)
-            return {"intent_class": "CONDITIONAL", "confidence": 0.60}
-
-    logger.info("Intent classified: CONDITIONAL (no keyword match, confidence=0.50)")
-    return {"intent_class": "CONDITIONAL", "confidence": 0.50}
+    return {"intent_class": intent_class, "call_outcome": intent_class, "confidence": confidence}
 
 
-def classify_intent(summary: str) -> dict[str, Any]:
+def _classify_via_keywords(transcript: str) -> dict[str, Any]:
+    text = transcript.lower()
+    for outcome, keywords in _KEYWORD_MAP:
+        for kw in keywords:
+            if kw in text:
+                logger.info("Keyword classified: %r (keyword=%r)", outcome, kw)
+                return {"intent_class": outcome, "call_outcome": outcome, "confidence": 0.55}
+
+    logger.info("No keyword match — defaulting to 'No Outcome / Unavailable'")
+    return {"intent_class": "No Outcome / Unavailable", "call_outcome": "No Outcome / Unavailable", "confidence": 0.40}
+
+
+def classify_intent(transcript: str) -> dict[str, Any]:
     """
-    Classify the intent from a transcript summary string.
-
-    Attempts Claude API first (if ANTHROPIC_API_KEY is set),
-    falls back to keyword-based classification on error or missing key.
+    Classify call outcome from the full transcript.
+    Tries Claude via OpenRouter first, falls back to keyword matching.
     """
-    # Try Claude API first
-    if os.getenv("ANTHROPIC_API_KEY"):
+    if os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY"):
         try:
-            return _classify_via_claude_api(summary)
+            return _classify_via_claude_api(transcript)
         except Exception as e:
-            logger.error("Claude API failed: %s, falling back to keyword classification", e)
-    else:
-        logger.debug("No ANTHROPIC_API_KEY found, using keyword-based classification")
+            logger.error("Claude API failed: %s — falling back to keywords", e)
 
-    # Fallback to keywords
-    return _classify_via_keywords(summary)
+    return _classify_via_keywords(transcript)
 
 
 def is_claude_api_available() -> bool:
-    """Check if Claude API is configured and available."""
-    return bool(os.getenv("ANTHROPIC_API_KEY"))
+    return bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY"))

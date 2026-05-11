@@ -122,7 +122,8 @@ def check_compliance(record: dict[str, Any], db: Session = None) -> dict[str, An
     # Determine final status
     if violations:
         status = "FAIL"
-        details = f"Violations: {', '.join(violations)}"
+        lines = [f"{code} — {VIOLATION_CODES.get(code, 'Unknown violation')}" for code in violations]
+        details = "\n".join(lines)
         logger.info("Compliance FAIL for dealer=%s — %d violations", record.get("dealer_id"), len(violations))
     else:
         status = "PASS"

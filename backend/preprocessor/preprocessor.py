@@ -22,14 +22,17 @@ from preprocessor.token_map import TOKEN_MAP, anonymise
 
 logger = logging.getLogger(__name__)
 
-# Keyword lists for sentiment scoring
+# Keyword lists for sentiment scoring — matched only against debtor lines
 _POSITIVE_KEYWORDS = [
     "will pay", "agree", "committed", "promise", "cooperate",
-    "arrangement", "payment plan", "thank", "appreciate", "yes",
+    "arrangement", "payment plan", "appreciate", "happy to",
+    "i can pay", "i'll pay", "send payment", "paid",
 ]
 _NEGATIVE_KEYWORDS = [
-    "refuse", "cannot", "won't", "dispute", "no money", "not able",
-    "hung up", "disconnected", "angry", "upset", "complain",
+    "refuse", "cannot", "won't", "will not", "dispute", "no money",
+    "not able", "hung up", "disconnected", "angry", "upset", "complain",
+    "not paying", "i won't", "i can't", "don't have", "no.",
+    "refused", "not interested",
 ]
 
 # Phone number pattern: 10-digit US numbers with optional separators
@@ -60,10 +63,24 @@ def _validate_pii_scrubbed(text: str) -> bool:
     return True
 
 
+def _extract_debtor_lines(transcript: str) -> str:
+    """
+    Extract only the debtor/user side of the conversation.
+    Handles prefixes: 'User:', 'Debtor:', 'Customer:', 'Client:'.
+    Falls back to full transcript if no speaker labels found.
+    """
+    import re as _re
+    debtor_re = _re.compile(r"(?:User|Debtor|Customer|Client)\s*:\s*(.+)", _re.IGNORECASE)
+    lines = debtor_re.findall(transcript)
+    if lines:
+        return " ".join(lines).lower()
+    return transcript.lower()
+
+
 def _compute_sentiment(transcript: str, raw_sentiment: Any) -> float:
     """
     Compute sentiment score. Uses raw_sentiment if provided,
-    otherwise falls back to keyword-based scoring.
+    otherwise scores only the debtor's lines via keyword matching.
     """
     if raw_sentiment is not None and raw_sentiment != "":
         try:
@@ -71,9 +88,9 @@ def _compute_sentiment(transcript: str, raw_sentiment: Any) -> float:
         except (ValueError, TypeError):
             pass
 
-    text_lower = transcript.lower()
-    pos_count = sum(1 for kw in _POSITIVE_KEYWORDS if kw in text_lower)
-    neg_count = sum(1 for kw in _NEGATIVE_KEYWORDS if kw in text_lower)
+    debtor_text = _extract_debtor_lines(transcript)
+    pos_count = sum(1 for kw in _POSITIVE_KEYWORDS if kw in debtor_text)
+    neg_count = sum(1 for kw in _NEGATIVE_KEYWORDS if kw in debtor_text)
     total = pos_count + neg_count
     if total == 0:
         return 0.5  # neutral default
@@ -127,7 +144,7 @@ def _extract_metadata(raw: dict[str, Any]) -> dict[str, Any]:
     """Pull structured fields from the raw input."""
     return {
         "dealer_id": raw.get("dealer_id", raw.get("call_id", "")),
-        "call_outcome": raw.get("call_outcome", "UNKNOWN"),
+        "call_outcome": raw.get("call_outcome", ""),  # overwritten by tm_service classifier
         "days_past_due": int(raw.get("past_due", raw.get("days_past_due", 0))),
         "debt_balance": float(
             raw.get("outstanding_amount", raw.get("original_balance", raw.get("debt_balance", 0.0)))

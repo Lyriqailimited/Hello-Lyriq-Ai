@@ -102,6 +102,8 @@ def ingest_call(
 
         metadata = enrich_metadata(processed)
         intent = classify_intent(cleaned_transcript or processed.get("transcript_summary", ""))
+        # call_outcome is set by classifier; overwrite preprocessor placeholder
+        processed["call_outcome"] = intent.get("call_outcome", "No Outcome / Unavailable")
 
         # Extract objections from transcript
         objections = extract_objections(
